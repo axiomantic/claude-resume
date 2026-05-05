@@ -57,9 +57,32 @@ recoverable on the next reboot, seed the log from existing transcripts:
     claude-resume list                  # all orphans across all repos
     claude-resume here                  # interactive picker for $PWD
     claude-resume here --quiet          # one-line nudge (used in shell rc)
+    claude-resume here --auto           # auto-resume in restored shells
     claude-resume launch                # resume all orphans in Ghostty (macOS)
     claude-resume backfill [--days N]   # seed log from existing transcripts
     claude-resume prune --keep-days 30  # compact the event log
+
+### Auto-resume in restored shells
+
+Ghostty's `window-save-state = always` restores tabs to the working
+directories they had at shutdown. With auto-resume enabled, each restored
+shell that lands in a cwd with a matching orphan will offer to resume it
+automatically — a 3-second countdown, then `claude --resume <id>` runs in
+that very shell. Press any key during the countdown to skip.
+
+To enable, edit the line `install.sh` adds to your `.zshrc`:
+
+    # default (just a nudge):
+    claude-resume here --quiet 2>/dev/null
+
+    # auto-resume (replace the line above with this):
+    claude-resume here --auto 2>/dev/null
+
+Multiple shells starting in the same cwd are handled atomically: the first
+to start writes a `claim` event to the log, and subsequent shells see no
+orphan there. Auto-resume is also suppressed when stdin isn't a TTY (e.g.
+under `ssh somehost zsh -c …`) and when `$CLAUDECODE` is set (so opening a
+shell from inside an existing Claude session doesn't recurse).
 
 ### `launch` (Ghostty, macOS)
 
