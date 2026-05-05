@@ -39,6 +39,12 @@ wire up the Claude Code hooks, and add a shell rc nudge:
 The installer is idempotent — safe to re-run, and it never touches an
 existing hook entry it didn't add.
 
+If you have `CLAUDE_CONFIG_DIR` set to a non-default value, the installer
+will detect it and confirm whether to wire hooks into that directory
+before proceeding. The `claude-resume` script itself reads from the same
+directory at runtime, so backfill, list, and here all stay consistent
+with whatever you chose at install time.
+
 If you've already been using Claude Code and want past sessions to be
 recoverable on the next reboot, seed the log from existing transcripts:
 
@@ -60,10 +66,14 @@ recoverable on the next reboot, seed the log from existing transcripts:
 
 ## Environment
 
-- `CLAUDE_CONFIG_DIR` — if set, overrides the location of Claude Code's
-  config (default `~/.claude`). The script reads transcripts from
-  `$CLAUDE_CONFIG_DIR/projects/`. The installer detects this var; when
-  set to a non-default value it asks before wiring hooks into it.
+- `CLAUDE_CONFIG_DIR` — overrides the location of Claude Code's config
+  directory (default `~/.claude`). Both the `claude-resume` script and
+  `install.sh` honor it:
+  - **`claude-resume`**: reads transcripts from
+    `$CLAUDE_CONFIG_DIR/projects/` for `backfill`, `list`, and `here`.
+  - **`install.sh`**: writes hooks into `$CLAUDE_CONFIG_DIR/settings.json`,
+    but when the value differs from the default it asks for confirmation
+    first — easy to mis-set, easy to wire hooks into the wrong place.
 
 ## Caveats
 
