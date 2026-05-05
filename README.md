@@ -66,9 +66,9 @@ recoverable on the next reboot, seed the log from existing transcripts:
 
 Ghostty's `window-save-state = always` restores tabs to the working
 directories they had at shutdown. With auto-resume enabled, each restored
-shell that lands in a cwd with a matching orphan will offer to resume it
-automatically — a 3-second countdown, then `claude --resume <id>` runs in
-that very shell. Press any key during the countdown to skip.
+shell that lands in a cwd with a matching orphan offers to resume it: a
+3-second countdown, then `claude --resume <id>` runs in that very shell.
+Press any key during the countdown to skip.
 
 To enable, edit the line `install.sh` adds to your `.zshrc`:
 
@@ -78,11 +78,19 @@ To enable, edit the line `install.sh` adds to your `.zshrc`:
     # auto-resume (replace the line above with this):
     claude-resume here --auto 2>/dev/null
 
-Multiple shells starting in the same cwd are handled atomically: the first
-to start writes a `claim` event to the log, and subsequent shells see no
-orphan there. Auto-resume is also suppressed when stdin isn't a TTY (e.g.
-under `ssh somehost zsh -c …`) and when `$CLAUDECODE` is set (so opening a
-shell from inside an existing Claude session doesn't recurse).
+**Auto-resume is bounded to a post-reboot window** — by default the first
+30 minutes after boot. Outside that window, `--auto` silently falls
+through to `--quiet` behavior (nudge only). This means a fresh shell you
+open three days later in a repo with a stale orphan does not trigger a
+surprise countdown. Tune with `--auto-window-minutes N`.
+
+Other safeguards:
+- The first restored shell in a cwd writes a `claim` event to the log;
+  subsequent shells in the same cwd see no orphan and stay quiet.
+- Non-TTY stdin (`ssh host zsh -c …`, scripts) suppresses auto-resume.
+- `$CLAUDECODE` set (i.e. you're already inside a Claude session)
+  suppresses auto-resume so opening a shell from within Claude doesn't
+  recurse.
 
 ### `launch` (Ghostty, macOS)
 

@@ -326,17 +326,30 @@ def cmd_here(args: argparse.Namespace) -> int:
         # Don't auto-resume from inside an existing Claude session.
         if os.environ.get("CLAUDECODE") or os.environ.get("CLAUDE_CODE_SESSION_ID"):
             return 0
-        target = orphans[0]  # most recently active (find_orphans sorts desc by mtime)
-        prompt = first_user_prompt(target["transcript_path"], max_chars=60)
-        msg = f"[claude-resume] auto-resuming {target['session_id'][:8]}"
-        if prompt:
-            msg += f' — "{prompt}"'
-        if not _countdown_with_abort(3, msg):
-            return 0
-        # Atomically claim before exec so racing shells in the same cwd don't
-        # both grab this orphan.
-        claim_session(target["session_id"])
-        os.execvp("claude", ["claude", "--resume", target["session_id"]])
+        # Auto-resume only fires within `--auto-window-minutes` of the most recent
+        # boot. The whole point of auto-resume is "this Ghostty tab was just
+        # restored from before reboot." Outside that window, opening a fresh shell
+        # in a repo with a stale orphan should not trigger a surprise countdown;
+        # fall through to the regular --quiet nudge instead.
+        try:
+            boot = get_boot_time()
+        except Exception:
+            boot = 0
+        elapsed_min = (time.time() - boot) / 60.0
+        if elapsed_min > args.auto_window_minutes:
+            args.quiet = True  # fall through to the quiet branch below
+        else:
+            target = orphans[0]  # most recently active (sorted desc by mtime)
+            prompt = first_user_prompt(target["transcript_path"], max_chars=60)
+            msg = f"[claude-resume] auto-resuming {target['session_id'][:8]}"
+            if prompt:
+                msg += f' — "{prompt}"'
+            if not _countdown_with_abort(3, msg):
+                return 0
+            # Atomically claim before exec so racing shells in the same cwd don't
+            # both grab this orphan.
+            claim_session(target["session_id"])
+            os.execvp("claude", ["claude", "--resume", target["session_id"]])
 
     if args.quiet:
         # One-line nudge for shell rc; don't prompt.
@@ -722,7 +735,10 @@ def main() -> int:
     p_here.add_argument("--max-age-hours", type=float, default=DEFAULT_MAX_AGE_HOURS)
     p_here.add_argument("--quiet", action="store_true", help="one-line nudge only")
     p_here.add_argument("--auto", action="store_true",
-                        help="auto-resume the most recent matching orphan after a 3s countdown")
+                        help="auto-resume the most recent matching orphan after a 3s countdown "
+                             "(only within the post-reboot window; falls through to --quiet otherwise)")
+    p_here.add_argument("--auto-window-minutes", type=float, default=30.0,
+                        help="how long after boot --auto stays active (default 30)")
     p_here.add_argument("--all", action="store_true",
                         help="ignore CLAUDE_CONFIG_DIR scoping; show every config dir")
     p_here.set_defaults(func=cmd_here)
