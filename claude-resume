@@ -60,6 +60,45 @@ def get_boot_time() -> int:
     return int(m.group(1))
 
 
+def _ps_field(pid: int, field: str) -> str | None:
+    """Run `ps -p <pid> -o <field>=` and return the output, or None if pid is gone.
+    Each call is one ps invocation — cheap enough for a few orphans per check."""
+    try:
+        r = subprocess.run(
+            ["ps", "-p", str(pid), "-o", f"{field}="],
+            capture_output=True, text=True, timeout=2,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if r.returncode != 0:
+        return None
+    out = r.stdout.strip()
+    return out if out else None
+
+
+def pid_is_our_claude(pid: int | None, expected_start_time: str | None) -> bool:
+    """True iff `pid` is the same Claude process we captured at SessionStart.
+
+    Verifies (pid still exists) AND (command name looks like claude/node) AND
+    (process start time matches what we stored). The start-time check is what
+    makes this robust to PID reuse — if PID 12345 has been recycled to a new
+    process since SessionStart, its `lstart` will differ.
+    """
+    if pid is None:
+        return False
+    cmd = _ps_field(pid, "command")
+    if cmd is None:
+        return False  # process gone
+    cmd_lc = cmd.lower()
+    if "claude" not in cmd_lc and "node" not in cmd_lc:
+        return False  # PID was recycled to something unrelated
+    if expected_start_time:
+        actual = _ps_field(pid, "lstart")
+        if actual != expected_start_time:
+            return False  # PID was recycled to another claude/node — not ours
+    return True
+
+
 # ---------- hook ----------
 
 
@@ -80,6 +119,10 @@ def cmd_hook(args: argparse.Namespace) -> int:
         now = time.time()
 
         if event_name == "SessionStart":
+            # The hook is spawned by the Claude process, so getppid() is Claude's pid.
+            # Capturing pid + lstart together makes liveness checks robust to PID reuse.
+            claude_pid = os.getppid()
+            pid_start_time = _ps_field(claude_pid, "lstart") if claude_pid else None
             record = {
                 "event": "start",
                 "session_id": session_id,
@@ -88,6 +131,8 @@ def cmd_hook(args: argparse.Namespace) -> int:
                 "ts": now,
                 "source": payload.get("source", ""),
                 "claude_config_dir": str(claude_config_dir()),
+                "pid": claude_pid,
+                "pid_start_time": pid_start_time,
             }
         elif event_name == "SessionEnd":
             record = {
@@ -188,9 +233,22 @@ def find_orphans(
             mtime = transcript.stat().st_mtime
         except OSError:
             continue
-        if mtime >= boot:
-            # Active during this boot — running now or ended this boot, skip.
-            continue
+
+        # Liveness: when we captured a pid at SessionStart, the (pid, start_time)
+        # tuple is the authoritative signal. If the process is still our Claude,
+        # the session is alive — never an orphan, regardless of mtime. If the
+        # process is gone (or PID got recycled to something else), it's a
+        # candidate orphan even if mtime is post-boot (covers within-boot kills
+        # like Cmd+Q on Ghostty).
+        recorded_pid = start.get("pid")
+        if recorded_pid is not None:
+            if pid_is_our_claude(recorded_pid, start.get("pid_start_time")):
+                continue  # still alive
+            # else: dead, fall through (no boot-mtime check needed)
+        else:
+            # Backfilled / pre-pid-tracking record: fall back to the boot fence.
+            if mtime >= boot:
+                continue
         if mtime < age_cutoff:
             continue
         orphans.append(

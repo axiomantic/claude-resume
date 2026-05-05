@@ -11,20 +11,28 @@ session's start and end, then comparing against the system boot time.
 
 ## How it works
 
-1. A `SessionStart` hook records `{session_id, cwd, transcript_path}` to an
-   append-only log on disk.
+1. A `SessionStart` hook records `{session_id, cwd, transcript_path,
+   pid, pid_start_time}` to an append-only log on disk.
 2. A `SessionEnd` hook records the close so we know which sessions ended
    cleanly.
-3. After a reboot, the tool finds sessions whose last logged event is a
-   start (no end), whose transcript file was last modified before the
-   current boot (proving the process is gone), and whose mtime is recent
-   enough to care about.
-4. The transcript file's mtime — updated by Claude on every message —
-   doubles as the activity heartbeat, so no background daemon is needed.
+3. To decide if a session is alive *right now*, the tool consults the
+   recorded `(pid, pid_start_time)` via `ps`. The start time check makes
+   the liveness signal robust to PID recycling — if PID 12345 has been
+   handed to a different process since SessionStart, its `lstart` will
+   differ.
+4. For records that have no recorded pid (pre-pid-tracking entries and
+   backfilled transcripts), the tool falls back to comparing transcript
+   mtime against the system boot time: anything from before the last
+   boot is dead, since the kernel zeroes its process table on every
+   boot.
+5. The transcript file's mtime — updated by Claude on every message —
+   doubles as a passive activity heartbeat for the fallback path. No
+   background daemon is needed.
 
-There's no PID tracking. PIDs are recycled across boots and even within a
-boot, and the boot-time fence makes the question "is this process still
-alive?" trivially answerable for anything from before the last boot.
+So the orphan check uses the strongest signal that's available per
+record: live `ps` lookup when we have a pid, boot-time fence otherwise.
+This catches both reboot-killed sessions and within-boot kills (e.g.
+Cmd+Q on Ghostty) without ever falsely claiming a still-running session.
 
 ## Install
 
