@@ -70,10 +70,26 @@ recoverable on the next reboot, seed the log from existing transcripts:
   directory (default `~/.claude`). Both the `claude-resume` script and
   `install.sh` honor it:
   - **`claude-resume`**: reads transcripts from
-    `$CLAUDE_CONFIG_DIR/projects/` for `backfill`, `list`, and `here`.
+    `$CLAUDE_CONFIG_DIR/projects/` for `backfill`, and scopes `list` /
+    `here` output to entries captured from that config dir. Pass `--all`
+    to see every config dir at once.
   - **`install.sh`**: writes hooks into `$CLAUDE_CONFIG_DIR/settings.json`,
     but when the value differs from the default it asks for confirmation
     first — easy to mis-set, easy to wire hooks into the wrong place.
+
+## Multiple Claude config dirs
+
+If you run Claude Code with more than one `CLAUDE_CONFIG_DIR` (e.g. a
+personal config and a work config), all events go to a single log at
+`~/.local/state/claude-resume/log.jsonl`. There's no risk of corruption
+— Claude session IDs are UUIDs, transcript paths are absolute, and each
+event records the config dir that captured it.
+
+By default `list` and `here` filter to the currently active config dir,
+so you only see orphans relevant to the environment you're in. Use
+`--all` to see every session ever captured. Entries written before this
+filtering existed have no recorded config dir and are treated as
+matching any scope.
 
 ## Caveats
 

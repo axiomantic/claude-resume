@@ -87,6 +87,7 @@ def cmd_hook(args: argparse.Namespace) -> int:
                 "cwd": payload.get("cwd", ""),
                 "ts": now,
                 "source": payload.get("source", ""),
+                "claude_config_dir": str(claude_config_dir()),
             }
         elif event_name == "SessionEnd":
             record = {
@@ -138,11 +139,13 @@ def load_sessions() -> dict[str, dict]:
 def find_orphans(
     max_age_hours: float = DEFAULT_MAX_AGE_HOURS,
     scope_cwd: str | None = None,
+    config_dir: pathlib.Path | None = None,
 ) -> tuple[list[dict], int]:
     boot = get_boot_time()
     age_cutoff = time.time() - max_age_hours * 3600
     sessions = load_sessions()
     orphans: list[dict] = []
+    config_dir_str = str(config_dir) if config_dir is not None else None
     for sid, info in sessions.items():
         if info["state"] != "open":
             continue
@@ -150,6 +153,11 @@ def find_orphans(
         cwd = start.get("cwd", "")
         if scope_cwd is not None and cwd != scope_cwd:
             continue
+        if config_dir_str is not None:
+            entry_cd = start.get("claude_config_dir")
+            # Backwards-compat: pre-tagging entries lack this field; include them.
+            if entry_cd is not None and entry_cd != config_dir_str:
+                continue
         transcript = pathlib.Path(start.get("transcript_path", ""))
         if not transcript.is_file():
             continue
@@ -216,11 +224,15 @@ def first_user_prompt(transcript_path: str, max_chars: int = 80) -> str:
 
 
 def cmd_list(args: argparse.Namespace) -> int:
-    orphans, boot = find_orphans(max_age_hours=args.max_age_hours)
+    cd = None if args.all else claude_config_dir()
+    orphans, boot = find_orphans(max_age_hours=args.max_age_hours, config_dir=cd)
     if not orphans:
-        print("No orphan Claude sessions from before last reboot.")
+        scope = "any config dir" if cd is None else f"config dir {cd}"
+        print(f"No orphan Claude sessions from before last reboot ({scope}).")
         return 0
     print(f"Last boot: {datetime.fromtimestamp(boot):%Y-%m-%d %H:%M}")
+    if cd is not None:
+        print(f"Scoped to: {cd} (use --all to include every config dir)")
     print(f"Found {len(orphans)} orphan session(s):\n")
     by_cwd: dict[str, list[dict]] = {}
     for o in orphans:
@@ -245,7 +257,8 @@ def cmd_list(args: argparse.Namespace) -> int:
 
 def cmd_here(args: argparse.Namespace) -> int:
     cwd = os.getcwd()
-    orphans, _ = find_orphans(max_age_hours=args.max_age_hours, scope_cwd=cwd)
+    cd = None if args.all else claude_config_dir()
+    orphans, _ = find_orphans(max_age_hours=args.max_age_hours, scope_cwd=cwd, config_dir=cd)
     if not orphans:
         return 0
     if args.quiet:
@@ -413,6 +426,7 @@ def cmd_backfill(args: argparse.Namespace) -> int:
                 "cwd": cwd,
                 "ts": started_at,
                 "source": "backfill",
+                "claude_config_dir": str(claude_config_dir()),
             }
             if args.dry_run:
                 pass
@@ -441,13 +455,17 @@ def main() -> int:
     p_hook = sub.add_parser("hook", help="(internal) handle SessionStart/SessionEnd events")
     p_hook.set_defaults(func=cmd_hook)
 
-    p_list = sub.add_parser("list", help="show all orphan sessions")
+    p_list = sub.add_parser("list", help="show orphan sessions for the active config dir")
     p_list.add_argument("--max-age-hours", type=float, default=DEFAULT_MAX_AGE_HOURS)
+    p_list.add_argument("--all", action="store_true",
+                        help="ignore CLAUDE_CONFIG_DIR scoping; show every config dir")
     p_list.set_defaults(func=cmd_list)
 
     p_here = sub.add_parser("here", help="show orphans matching $PWD")
     p_here.add_argument("--max-age-hours", type=float, default=DEFAULT_MAX_AGE_HOURS)
     p_here.add_argument("--quiet", action="store_true", help="one-line nudge only")
+    p_here.add_argument("--all", action="store_true",
+                        help="ignore CLAUDE_CONFIG_DIR scoping; show every config dir")
     p_here.set_defaults(func=cmd_here)
 
     p_prune = sub.add_parser("prune", help="compact the event log")
