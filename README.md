@@ -56,8 +56,7 @@ recoverable on the next reboot, seed the log from existing transcripts:
 
     claude-resume list                  # all orphans across all repos
     claude-resume here                  # interactive picker for $PWD
-    claude-resume here --quiet          # one-line nudge (used in shell rc)
-    claude-resume here --auto           # auto-resume in restored shells
+    claude-resume here --auto           # silent atomic pop + exec (for .zshrc)
     claude-resume launch                # resume all orphans in Ghostty (macOS)
     claude-resume backfill [--days N]   # seed log from existing transcripts
     claude-resume prune --keep-days 30  # compact the event log
@@ -65,32 +64,34 @@ recoverable on the next reboot, seed the log from existing transcripts:
 ### Auto-resume in restored shells
 
 Ghostty's `window-save-state = always` restores tabs to the working
-directories they had at shutdown. With auto-resume enabled, each restored
-shell that lands in a cwd with a matching orphan offers to resume it: a
-3-second countdown, then `claude --resume <id>` runs in that very shell.
-Press any key during the countdown to skip.
+directories they had at shutdown. The installer adds a one-liner to
+`.zshrc` that turns each restored shell into an automatic resume:
 
-To enable, edit the line `install.sh` adds to your `.zshrc`:
+    if command -v claude-resume >/dev/null 2>&1; then
+      claude-resume here --auto
+    fi
 
-    # default (just a nudge):
-    claude-resume here --quiet 2>/dev/null
+`here --auto` runs silently. If there's an orphan Claude session whose
+captured cwd matches `$PWD`, it atomically claims one and `exec`s
+`claude --resume <id>`. If there's nothing to claim, it returns 0 and
+zsh continues normally. There is no countdown, prompt, or nudge.
 
-    # auto-resume (replace the line above with this):
-    claude-resume here --auto 2>/dev/null
+Concretely: if you had four sessions running in `~/Development/banana`
+at shutdown and you open four Ghostty tabs in `~/Development/banana`
+after reboot, each tab resumes a different session. If you only open
+one tab, the other three orphans stay in the pool and get picked up
+the next time you open shells in that directory. Sessions you `/exit`
+cleanly fire `SessionEnd` and drop out of the pool, so they won't
+auto-resume.
 
-**Auto-resume is bounded to a post-reboot window** — by default the first
-30 minutes after boot. Outside that window, `--auto` silently falls
-through to `--quiet` behavior (nudge only). This means a fresh shell you
-open three days later in a repo with a stale orphan does not trigger a
-surprise countdown. Tune with `--auto-window-minutes N`.
+Concurrency: the find-and-claim step holds an `fcntl.flock` on the
+log file, so racing shells in the same cwd each pop a distinct orphan
+instead of all grabbing the same one.
 
-Other safeguards:
-- The first restored shell in a cwd writes a `claim` event to the log;
-  subsequent shells in the same cwd see no orphan and stay quiet.
-- Non-TTY stdin (`ssh host zsh -c …`, scripts) suppresses auto-resume.
-- `$CLAUDECODE` set (i.e. you're already inside a Claude session)
-  suppresses auto-resume so opening a shell from within Claude doesn't
-  recurse.
+Auto-resume is suppressed when `$CLAUDECODE` is set (so opening a
+shell from inside an existing Claude session doesn't recurse) and
+when stdin isn't a TTY (so scripts and `ssh host zsh -c …` are
+unaffected).
 
 ### `launch` (Ghostty, macOS)
 

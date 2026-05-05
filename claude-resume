@@ -278,92 +278,64 @@ def cmd_list(args: argparse.Namespace) -> int:
 # ---------- here ----------
 
 
-def _wait_for_keypress_or_timeout(seconds: float) -> bool:
-    """Block up to `seconds` for a keypress on stdin. Returns True if a key was
-    pressed, False on timeout. Restores terminal state on the way out."""
-    import select
-    import termios
-    import tty
-    if not sys.stdin.isatty():
-        time.sleep(seconds)
-        return False
-    fd = sys.stdin.fileno()
-    old = termios.tcgetattr(fd)
-    try:
-        tty.setcbreak(fd)
-        rlist, _, _ = select.select([sys.stdin], [], [], seconds)
-        if rlist:
-            sys.stdin.read(1)  # consume
-            return True
-        return False
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+def find_and_claim_one(scope_cwd: str, config_dir: pathlib.Path | None) -> dict | None:
+    """Atomically pick one orphan for `scope_cwd` and claim it.
 
-
-def _countdown_with_abort(seconds: int, message: str) -> bool:
-    """Show a countdown that the user can abort with any keypress.
-    Returns True if the countdown completed (proceed); False if aborted."""
-    if not sys.stdin.isatty():
-        # Non-interactive shell: don't auto-resume.
-        return False
-    for i in range(seconds, 0, -1):
-        print(f"\r{message} {i}s (any key to skip)... ", end="", flush=True)
-        if _wait_for_keypress_or_timeout(1.0):
-            print("\rAborted.                                                    ")
-            return False
-    print("\r" + " " * (len(message) + 40) + "\r", end="", flush=True)
-    return True
+    Holds an exclusive flock on the log file across the read+write so that N
+    shells racing in the same cwd each pop a distinct orphan instead of all
+    grabbing the most recent. Returns the claimed orphan dict, or None if
+    nothing is available.
+    """
+    import fcntl
+    ensure_state()
+    with LOG_FILE.open("a+") as f:
+        # Append-mode + flock: writes are serialized; the seek(0) below re-reads
+        # the freshest log state from anyone who appended before us.
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        try:
+            orphans, _ = find_orphans(
+                max_age_hours=float("inf"),
+                scope_cwd=scope_cwd,
+                config_dir=config_dir,
+            )
+            if not orphans:
+                return None
+            target = orphans[0]
+            record = {
+                "event": "claim",
+                "session_id": target["session_id"],
+                "ts": time.time(),
+                "claimed_by_pid": os.getpid(),
+            }
+            f.write(json.dumps(record) + "\n")
+            f.flush()
+            return target
+        finally:
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
 
 def cmd_here(args: argparse.Namespace) -> int:
     cwd = os.getcwd()
     cd = None if args.all else claude_config_dir()
+
+    if args.auto:
+        # Don't recurse into a Claude session from a Claude-spawned shell.
+        if os.environ.get("CLAUDECODE") or os.environ.get("CLAUDE_CODE_SESSION_ID"):
+            return 0
+        # Non-interactive shells: nothing to attach to.
+        if not sys.stdin.isatty():
+            return 0
+        target = find_and_claim_one(scope_cwd=cwd, config_dir=cd)
+        if target is None:
+            return 0
+        os.execvp("claude", ["claude", "--resume", target["session_id"]])
+        # Unreachable.
+        return 0
+
+    # Interactive picker.
     orphans, _ = find_orphans(max_age_hours=args.max_age_hours, scope_cwd=cwd, config_dir=cd)
     if not orphans:
         return 0
-
-    if args.auto:
-        # Don't auto-resume from inside an existing Claude session.
-        if os.environ.get("CLAUDECODE") or os.environ.get("CLAUDE_CODE_SESSION_ID"):
-            return 0
-        # Auto-resume only fires within `--auto-window-minutes` of the most recent
-        # boot. The whole point of auto-resume is "this Ghostty tab was just
-        # restored from before reboot." Outside that window, opening a fresh shell
-        # in a repo with a stale orphan should not trigger a surprise countdown;
-        # fall through to the regular --quiet nudge instead.
-        try:
-            boot = get_boot_time()
-        except Exception:
-            boot = 0
-        elapsed_min = (time.time() - boot) / 60.0
-        if elapsed_min > args.auto_window_minutes:
-            args.quiet = True  # fall through to the quiet branch below
-        else:
-            target = orphans[0]  # most recently active (sorted desc by mtime)
-            prompt = first_user_prompt(target["transcript_path"], max_chars=60)
-            msg = f"[claude-resume] auto-resuming {target['session_id'][:8]}"
-            if prompt:
-                msg += f' — "{prompt}"'
-            if not _countdown_with_abort(3, msg):
-                return 0
-            # Atomically claim before exec so racing shells in the same cwd don't
-            # both grab this orphan.
-            claim_session(target["session_id"])
-            os.execvp("claude", ["claude", "--resume", target["session_id"]])
-
-    if args.quiet:
-        # One-line nudge for shell rc; don't prompt.
-        n = len(orphans)
-        latest = orphans[0]
-        prompt = first_user_prompt(latest["transcript_path"])
-        suffix = f' — "{prompt}"' if prompt else ""
-        if n == 1:
-            print(f"[claude-resume] 1 orphan session here, last active {fmt_age(latest['mtime'])}{suffix}")
-            print(f"[claude-resume] resume: claude --resume {latest['session_id']}")
-        else:
-            print(f"[claude-resume] {n} orphan sessions here. Run: claude-resume here")
-        return 0
-
     print(f"Orphan Claude sessions in {cwd}:\n")
     for i, o in enumerate(orphans, 1):
         prompt = first_user_prompt(o["transcript_path"])
@@ -387,6 +359,7 @@ def cmd_here(args: argparse.Namespace) -> int:
         print(f"Invalid choice: {choice!r}", file=sys.stderr)
         return 1
 
+    claim_session(target["session_id"])
     cmd = ["claude", "--resume", target["session_id"]]
     print(f"$ {' '.join(shlex.quote(c) for c in cmd)}")
     os.execvp(cmd[0], cmd)
@@ -731,14 +704,12 @@ def main() -> int:
                         help="ignore CLAUDE_CONFIG_DIR scoping; show every config dir")
     p_list.set_defaults(func=cmd_list)
 
-    p_here = sub.add_parser("here", help="show orphans matching $PWD")
-    p_here.add_argument("--max-age-hours", type=float, default=DEFAULT_MAX_AGE_HOURS)
-    p_here.add_argument("--quiet", action="store_true", help="one-line nudge only")
+    p_here = sub.add_parser("here", help="resume an orphan session in $PWD")
+    p_here.add_argument("--max-age-hours", type=float, default=DEFAULT_MAX_AGE_HOURS,
+                        help="(interactive picker only) hide orphans older than N hours")
     p_here.add_argument("--auto", action="store_true",
-                        help="auto-resume the most recent matching orphan after a 3s countdown "
-                             "(only within the post-reboot window; falls through to --quiet otherwise)")
-    p_here.add_argument("--auto-window-minutes", type=float, default=30.0,
-                        help="how long after boot --auto stays active (default 30)")
+                        help="silently atomically pop one orphan and exec claude --resume; "
+                             "intended for .zshrc invocation")
     p_here.add_argument("--all", action="store_true",
                         help="ignore CLAUDE_CONFIG_DIR scoping; show every config dir")
     p_here.set_defaults(func=cmd_here)

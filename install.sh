@@ -13,7 +13,8 @@ PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SCRIPT="$PROJECT_DIR/claude-resume"
 BIN="$HOME/.local/bin/claude-resume"
 ZSHRC="$HOME/.zshrc"
-ZSHRC_MARKER="# claude-resume: nudge if there's an orphan Claude session in this dir"
+ZSHRC_MARKER="# claude-resume: auto-resume orphan Claude session in this cwd"
+ZSHRC_OLD_MARKER="# claude-resume: nudge if there's an orphan Claude session in this dir"
 
 # Resolve Claude config dir. If CLAUDE_CONFIG_DIR is set and differs from the
 # default, confirm with the user before using it — easy to mis-set this and
@@ -96,18 +97,45 @@ with settings_path.open("w") as f:
     f.write("\n")
 PY
 
-# 3. Zshrc nudge
+# 3. Zshrc auto-resume hook
 if [ -f "$ZSHRC" ] && grep -qF "$ZSHRC_MARKER" "$ZSHRC"; then
-  echo "zshrc nudge already present"
+  echo "zshrc auto-resume already present"
+elif [ -f "$ZSHRC" ] && grep -qF "$ZSHRC_OLD_MARKER" "$ZSHRC"; then
+  # Upgrade an old --quiet block to the new --auto block in-place.
+  python3 - "$ZSHRC" "$ZSHRC_OLD_MARKER" "$ZSHRC_MARKER" <<'PY'
+import sys, pathlib, re
+zshrc, old_marker, new_marker = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+text = zshrc.read_text()
+# Match: blank line + old marker + the if-fi block, replace with new marker block.
+pattern = re.compile(
+    r"\n?" + re.escape(old_marker) + r"\n"
+    r"if command -v claude-resume >/dev/null 2>&1; then\n"
+    r"  claude-resume here --quiet 2>/dev/null\n"
+    r"fi\n",
+    re.MULTILINE,
+)
+new_block = (
+    "\n" + new_marker + "\n"
+    "if command -v claude-resume >/dev/null 2>&1; then\n"
+    "  claude-resume here --auto\n"
+    "fi\n"
+)
+new_text, n = pattern.subn(new_block, text, count=1)
+if n:
+    zshrc.write_text(new_text)
+    print(f"upgraded {zshrc} (--quiet -> --auto)")
+else:
+    print(f"warning: old marker found but block did not match expected layout; leaving alone")
+PY
 else
   cat >>"$ZSHRC" <<EOF
 
 $ZSHRC_MARKER
 if command -v claude-resume >/dev/null 2>&1; then
-  claude-resume here --quiet 2>/dev/null
+  claude-resume here --auto
 fi
 EOF
-  echo "appended nudge to $ZSHRC"
+  echo "appended auto-resume hook to $ZSHRC"
 fi
 
 echo
