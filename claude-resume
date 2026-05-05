@@ -1,0 +1,474 @@
+#!/usr/bin/env python3
+"""claude-resume — surface Claude Code sessions that were running at last shutdown.
+
+Subcommands:
+  hook    Internal. Called by Claude Code SessionStart/SessionEnd hooks.
+          Reads JSON event from stdin; appends to ~/.local/state/claude-resume/log.jsonl.
+  list    Show all orphan sessions across all repos.
+  here    Show orphans matching $PWD. Interactive resume.
+  prune   Compact the log; drop closed sessions older than --keep-days.
+
+A session is an "orphan" iff:
+  * its last logged event is SessionStart (no SessionEnd recorded), AND
+  * its transcript file's mtime predates the current system boot, AND
+  * its mtime is within --max-age-hours.
+
+The first condition catches "user never typed /exit." The second proves the
+process is dead by definition (kernel zeroes the process table on boot). The
+third filters out forgotten sessions from weeks ago.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import pathlib
+import re
+import shlex
+import subprocess
+import sys
+import time
+from datetime import datetime
+
+STATE_DIR = pathlib.Path.home() / ".local" / "state" / "claude-resume"
+LOG_FILE = STATE_DIR / "log.jsonl"
+DEFAULT_MAX_AGE_HOURS = 48
+DEFAULT_KEEP_DAYS = 30
+
+
+def claude_config_dir() -> pathlib.Path:
+    """Return the Claude Code config dir. Honors $CLAUDE_CONFIG_DIR if set."""
+    override = os.environ.get("CLAUDE_CONFIG_DIR")
+    if override:
+        return pathlib.Path(override).expanduser()
+    return pathlib.Path.home() / ".claude"
+
+
+def ensure_state() -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    if not LOG_FILE.exists():
+        LOG_FILE.touch()
+
+
+def get_boot_time() -> int:
+    """Return system boot time as epoch seconds (macOS / BSD via sysctl)."""
+    out = subprocess.check_output(["sysctl", "-n", "kern.boottime"], text=True)
+    m = re.search(r"sec\s*=\s*(\d+)", out)
+    if not m:
+        raise RuntimeError(f"could not parse kern.boottime: {out!r}")
+    return int(m.group(1))
+
+
+# ---------- hook ----------
+
+
+def cmd_hook(args: argparse.Namespace) -> int:
+    """Append a single event to the log. Never block Claude — swallow errors."""
+    try:
+        ensure_state()
+        try:
+            payload = json.load(sys.stdin)
+        except (json.JSONDecodeError, ValueError):
+            return 0
+
+        event_name = payload.get("hook_event_name", "")
+        session_id = payload.get("session_id")
+        if not session_id:
+            return 0
+
+        now = time.time()
+
+        if event_name == "SessionStart":
+            record = {
+                "event": "start",
+                "session_id": session_id,
+                "transcript_path": payload.get("transcript_path", ""),
+                "cwd": payload.get("cwd", ""),
+                "ts": now,
+                "source": payload.get("source", ""),
+            }
+        elif event_name == "SessionEnd":
+            record = {
+                "event": "end",
+                "session_id": session_id,
+                "ts": now,
+                "reason": payload.get("reason", ""),
+            }
+        else:
+            return 0
+
+        with LOG_FILE.open("a") as f:
+            f.write(json.dumps(record) + "\n")
+    except Exception:
+        # A failing hook must never break Claude.
+        pass
+    return 0
+
+
+# ---------- core ----------
+
+
+def load_sessions() -> dict[str, dict]:
+    """Replay log; return dict[session_id] -> {state, start, end}."""
+    sessions: dict[str, dict] = {}
+    if not LOG_FILE.exists():
+        return sessions
+    with LOG_FILE.open() as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                r = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            sid = r.get("session_id")
+            if not sid:
+                continue
+            ev = r.get("event")
+            if ev == "start":
+                sessions[sid] = {"state": "open", "start": r, "end": None}
+            elif ev == "end" and sid in sessions:
+                sessions[sid]["state"] = "closed"
+                sessions[sid]["end"] = r
+    return sessions
+
+
+def find_orphans(
+    max_age_hours: float = DEFAULT_MAX_AGE_HOURS,
+    scope_cwd: str | None = None,
+) -> tuple[list[dict], int]:
+    boot = get_boot_time()
+    age_cutoff = time.time() - max_age_hours * 3600
+    sessions = load_sessions()
+    orphans: list[dict] = []
+    for sid, info in sessions.items():
+        if info["state"] != "open":
+            continue
+        start = info["start"]
+        cwd = start.get("cwd", "")
+        if scope_cwd is not None and cwd != scope_cwd:
+            continue
+        transcript = pathlib.Path(start.get("transcript_path", ""))
+        if not transcript.is_file():
+            continue
+        try:
+            mtime = transcript.stat().st_mtime
+        except OSError:
+            continue
+        if mtime >= boot:
+            # Active during this boot — running now or ended this boot, skip.
+            continue
+        if mtime < age_cutoff:
+            continue
+        orphans.append(
+            {
+                "session_id": sid,
+                "cwd": cwd,
+                "transcript_path": str(transcript),
+                "mtime": mtime,
+                "started_at": start.get("ts"),
+            }
+        )
+    orphans.sort(key=lambda o: o["mtime"], reverse=True)
+    return orphans, boot
+
+
+def fmt_age(ts: float) -> str:
+    secs = max(0, time.time() - ts)
+    if secs < 60:
+        return f"{int(secs)}s ago"
+    if secs < 3600:
+        return f"{int(secs / 60)}m ago"
+    if secs < 86400:
+        return f"{int(secs / 3600)}h ago"
+    return f"{int(secs / 86400)}d ago"
+
+
+def first_user_prompt(transcript_path: str, max_chars: int = 80) -> str:
+    """Best-effort: extract the first user message from a Claude transcript."""
+    try:
+        with open(transcript_path) as f:
+            for line in f:
+                try:
+                    r = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if r.get("type") != "user":
+                    continue
+                msg = r.get("message", {})
+                content = msg.get("content", "")
+                if isinstance(content, list):
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "text":
+                            content = block.get("text", "")
+                            break
+                if isinstance(content, str) and content.strip():
+                    snippet = content.strip().split("\n", 1)[0]
+                    return snippet[:max_chars]
+    except OSError:
+        pass
+    return ""
+
+
+# ---------- list ----------
+
+
+def cmd_list(args: argparse.Namespace) -> int:
+    orphans, boot = find_orphans(max_age_hours=args.max_age_hours)
+    if not orphans:
+        print("No orphan Claude sessions from before last reboot.")
+        return 0
+    print(f"Last boot: {datetime.fromtimestamp(boot):%Y-%m-%d %H:%M}")
+    print(f"Found {len(orphans)} orphan session(s):\n")
+    by_cwd: dict[str, list[dict]] = {}
+    for o in orphans:
+        by_cwd.setdefault(o["cwd"], []).append(o)
+    for cwd, items in by_cwd.items():
+        print(f"  {cwd or '(unknown cwd)'}")
+        for o in items:
+            prompt = first_user_prompt(o["transcript_path"])
+            print(
+                f"    {o['session_id'][:8]}  {fmt_age(o['mtime']):>8}"
+                f"  {prompt}" if prompt
+                else f"    {o['session_id'][:8]}  {fmt_age(o['mtime']):>8}"
+            )
+            cmd = f"cd {shlex.quote(cwd)} && claude --resume {o['session_id']}"
+            print(f"      $ {cmd}")
+        print()
+    return 0
+
+
+# ---------- here ----------
+
+
+def cmd_here(args: argparse.Namespace) -> int:
+    cwd = os.getcwd()
+    orphans, _ = find_orphans(max_age_hours=args.max_age_hours, scope_cwd=cwd)
+    if not orphans:
+        return 0
+    if args.quiet:
+        # One-line nudge for shell rc; don't prompt.
+        n = len(orphans)
+        latest = orphans[0]
+        prompt = first_user_prompt(latest["transcript_path"])
+        suffix = f' — "{prompt}"' if prompt else ""
+        if n == 1:
+            print(f"[claude-resume] 1 orphan session here, last active {fmt_age(latest['mtime'])}{suffix}")
+            print(f"[claude-resume] resume: claude --resume {latest['session_id']}")
+        else:
+            print(f"[claude-resume] {n} orphan sessions here. Run: claude-resume here")
+        return 0
+
+    print(f"Orphan Claude sessions in {cwd}:\n")
+    for i, o in enumerate(orphans, 1):
+        prompt = first_user_prompt(o["transcript_path"])
+        line = f"  [{i}] {o['session_id'][:8]}  {fmt_age(o['mtime']):>8}"
+        if prompt:
+            line += f"  {prompt}"
+        print(line)
+    print(f"  [q] quit\n")
+
+    try:
+        choice = input("Resume which? ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return 0
+    if choice in ("", "q", "quit", "n", "no"):
+        return 0
+    try:
+        idx = int(choice) - 1
+        target = orphans[idx]
+    except (ValueError, IndexError):
+        print(f"Invalid choice: {choice!r}", file=sys.stderr)
+        return 1
+
+    cmd = ["claude", "--resume", target["session_id"]]
+    print(f"$ {' '.join(shlex.quote(c) for c in cmd)}")
+    os.execvp(cmd[0], cmd)
+
+
+# ---------- prune ----------
+
+
+def cmd_prune(args: argparse.Namespace) -> int:
+    if not LOG_FILE.exists():
+        return 0
+    cutoff = time.time() - args.keep_days * 86400
+    sessions = load_sessions()
+    keep_ids = {
+        sid
+        for sid, info in sessions.items()
+        if info["state"] == "open" or (info.get("end") and info["end"]["ts"] >= cutoff)
+    }
+    kept_lines = 0
+    dropped_lines = 0
+    tmp = LOG_FILE.with_suffix(".jsonl.tmp")
+    with LOG_FILE.open() as src, tmp.open("w") as dst:
+        for line in src:
+            try:
+                r = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            sid = r.get("session_id")
+            if sid in keep_ids:
+                dst.write(line)
+                kept_lines += 1
+            else:
+                dropped_lines += 1
+    tmp.replace(LOG_FILE)
+    print(f"Kept {kept_lines}, dropped {dropped_lines}.")
+    return 0
+
+
+# ---------- backfill ----------
+
+
+def _parse_iso8601(s: str) -> float | None:
+    """Parse Claude Code's ISO 8601 timestamp ('2026-05-04T20:46:47.608Z')."""
+    if not s:
+        return None
+    try:
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        return datetime.fromisoformat(s).timestamp()
+    except ValueError:
+        return None
+
+
+def _scan_transcript(path: pathlib.Path, max_lines: int = 20) -> tuple[str | None, float | None]:
+    """Return (cwd, first_timestamp) by reading the head of a transcript."""
+    cwd = None
+    ts = None
+    try:
+        with path.open() as f:
+            for i, line in enumerate(f):
+                if i >= max_lines:
+                    break
+                try:
+                    r = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if cwd is None and r.get("cwd"):
+                    cwd = r["cwd"]
+                if ts is None:
+                    ts = _parse_iso8601(r.get("timestamp", ""))
+                if cwd and ts:
+                    break
+    except OSError:
+        pass
+    return cwd, ts
+
+
+def _decode_project_dir(name: str) -> str:
+    """Lossy fallback: '-Users-eek-Development-foo' -> '/Users/eek/Development/foo'.
+    Lossy because original path dashes are indistinguishable from slash separators.
+    """
+    return name.replace("-", "/")
+
+
+def cmd_backfill(args: argparse.Namespace) -> int:
+    ensure_state()
+    projects_dir = claude_config_dir() / "projects"
+    if not projects_dir.is_dir():
+        print(f"No Claude projects directory at {projects_dir}", file=sys.stderr)
+        return 1
+
+    known_ids = set(load_sessions().keys())
+    cutoff = None if args.all else time.time() - args.days * 86400
+
+    scanned = 0
+    skipped_known = 0
+    skipped_old = 0
+    added = 0
+    no_cwd = 0
+
+    with LOG_FILE.open("a") as out:
+        for transcript in projects_dir.glob("*/*.jsonl"):
+            scanned += 1
+            try:
+                st = transcript.stat()
+            except OSError:
+                continue
+            if cutoff is not None and st.st_mtime < cutoff:
+                skipped_old += 1
+                continue
+
+            session_id = transcript.stem
+            if session_id in known_ids:
+                skipped_known += 1
+                continue
+
+            cwd, first_ts = _scan_transcript(transcript)
+            if not cwd:
+                cwd = _decode_project_dir(transcript.parent.name)
+                no_cwd += 1
+            started_at = first_ts if first_ts is not None else st.st_mtime
+
+            record = {
+                "event": "start",
+                "session_id": session_id,
+                "transcript_path": str(transcript),
+                "cwd": cwd,
+                "ts": started_at,
+                "source": "backfill",
+            }
+            if args.dry_run:
+                pass
+            else:
+                out.write(json.dumps(record) + "\n")
+            added += 1
+            known_ids.add(session_id)
+
+    verb = "would add" if args.dry_run else "added"
+    print(f"Scanned {scanned} transcripts.")
+    print(f"  Skipped (already known): {skipped_known}")
+    print(f"  Skipped (older than cutoff): {skipped_old}")
+    print(f"  {verb}: {added}")
+    if no_cwd:
+        print(f"  ({no_cwd} of those had no cwd in transcript; used decoded directory name)")
+    return 0
+
+
+# ---------- main ----------
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(prog="claude-resume", description=__doc__.split("\n", 1)[0])
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    p_hook = sub.add_parser("hook", help="(internal) handle SessionStart/SessionEnd events")
+    p_hook.set_defaults(func=cmd_hook)
+
+    p_list = sub.add_parser("list", help="show all orphan sessions")
+    p_list.add_argument("--max-age-hours", type=float, default=DEFAULT_MAX_AGE_HOURS)
+    p_list.set_defaults(func=cmd_list)
+
+    p_here = sub.add_parser("here", help="show orphans matching $PWD")
+    p_here.add_argument("--max-age-hours", type=float, default=DEFAULT_MAX_AGE_HOURS)
+    p_here.add_argument("--quiet", action="store_true", help="one-line nudge only")
+    p_here.set_defaults(func=cmd_here)
+
+    p_prune = sub.add_parser("prune", help="compact the event log")
+    p_prune.add_argument("--keep-days", type=float, default=DEFAULT_KEEP_DAYS)
+    p_prune.set_defaults(func=cmd_prune)
+
+    p_back = sub.add_parser(
+        "backfill",
+        help="seed the log from existing Claude transcripts (~/.claude/projects)",
+    )
+    p_back.add_argument("--days", type=float, default=7,
+                        help="only include transcripts modified in the last N days (default 7)")
+    p_back.add_argument("--all", action="store_true",
+                        help="include every transcript, regardless of age")
+    p_back.add_argument("--dry-run", action="store_true",
+                        help="report what would be added without writing")
+    p_back.set_defaults(func=cmd_backfill)
+
+    args = p.parse_args()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
