@@ -445,6 +445,186 @@ def cmd_backfill(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---------- launch (Ghostty) ----------
+
+
+def _osa_quote(s: str) -> str:
+    """Escape a Python string for use inside an AppleScript double-quoted literal."""
+    return s.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _run_osascript(script: str) -> str:
+    """Run an AppleScript via osascript and return stdout. Raises on failure."""
+    proc = subprocess.run(
+        ["osascript", "-"],
+        input=script,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"osascript failed: {proc.stderr.strip()}")
+    return proc.stdout
+
+
+def ghostty_running() -> bool:
+    """Check via System Events to avoid pgrep visibility quirks under sandboxing."""
+    try:
+        out = _run_osascript(
+            'tell application "System Events" to '
+            'return (exists (first process whose bundle identifier is "com.mitchellh.ghostty"))'
+        )
+    except RuntimeError:
+        return False
+    return out.strip().lower() == "true"
+
+
+def ghostty_list_terminals() -> list[dict]:
+    """Return [{id, cwd, title}] for every Ghostty terminal surface."""
+    script = '''
+tell application "Ghostty"
+    set output to ""
+    repeat with t in terminals
+        try
+            set output to output & (id of t) & tab & (working directory of t) & tab & (name of t) & linefeed
+        end try
+    end repeat
+    return output
+end tell
+'''
+    out = _run_osascript(script)
+    rows: list[dict] = []
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 3:
+            continue
+        rows.append({"id": parts[0], "cwd": parts[1], "title": parts[2]})
+    return rows
+
+
+def _looks_idle(title: str, cwd: str) -> bool:
+    """Heuristic: a terminal whose title is a path (its cwd) is sitting at a shell
+    prompt. A title showing a process name (claude, vim, python, etc.) is busy."""
+    if not title:
+        return True
+    t = title.strip()
+    # Common shell-integration patterns: "~/path", "/abs/path", or basename
+    if t.startswith("/") or t.startswith("~"):
+        return True
+    # Title equals cwd basename
+    try:
+        if t == os.path.basename(cwd) or t == cwd:
+            return True
+    except Exception:
+        pass
+    # Bare shell names
+    if t in {"zsh", "bash", "fish", "sh"}:
+        return True
+    return False
+
+
+def ghostty_inject(terminal_id: str, cmd: str) -> None:
+    """Type `cmd` followed by Enter into the given terminal."""
+    script = f'''
+tell application "Ghostty"
+    set t to first terminal whose id is "{_osa_quote(terminal_id)}"
+    activate
+    focus t
+    input text "{_osa_quote(cmd)}" to t
+    send key "enter" to t
+end tell
+'''
+    _run_osascript(script)
+
+
+def ghostty_new_tab(cwd: str, cmd: str) -> None:
+    """Open a new tab in the front Ghostty window with cwd, send cmd as initial input.
+
+    Ghostty's `new tab` requires an explicit target window — the .sdef marks `in`
+    optional but bare invocation returns -1708. `front window` is the natural choice.
+    The `\\n` in initial input auto-submits the command after the shell starts.
+    """
+    script = f'''
+tell application "Ghostty"
+    activate
+    new tab in front window with configuration {{initial working directory:"{_osa_quote(cwd)}", initial input:"{_osa_quote(cmd)}\\n"}}
+end tell
+'''
+    _run_osascript(script)
+
+
+def cmd_launch(args: argparse.Namespace) -> int:
+    cd = None if args.all else claude_config_dir()
+    scope_cwd = os.getcwd() if args.here else None
+    orphans, _ = find_orphans(
+        max_age_hours=args.max_age_hours, scope_cwd=scope_cwd, config_dir=cd,
+    )
+    if not orphans:
+        print("No orphan sessions to launch.")
+        return 0
+
+    if not ghostty_running():
+        print("Ghostty isn't running. Open it (so we have a window to add tabs to) and try again.", file=sys.stderr)
+        return 1
+
+    try:
+        terminals = ghostty_list_terminals()
+    except RuntimeError as e:
+        print(f"Failed to query Ghostty: {e}", file=sys.stderr)
+        return 1
+
+    # Build a pool of idle Ghostty terminals keyed by cwd.
+    idle_pool: dict[str, list[str]] = {}
+    if not args.new_tabs_only:
+        for term in terminals:
+            if _looks_idle(term["title"], term["cwd"]):
+                idle_pool.setdefault(term["cwd"], []).append(term["id"])
+
+    # Build the plan.
+    plan: list[tuple[str, str | None, dict]] = []
+    for o in orphans:
+        pool = idle_pool.get(o["cwd"], [])
+        if pool:
+            plan.append(("inject", pool.pop(0), o))
+        else:
+            plan.append(("new-tab", None, o))
+
+    # Print the plan.
+    print(f"Plan ({len(plan)} session(s)):")
+    for kind, tid, o in plan:
+        target = f"existing tab {tid[:8]}" if kind == "inject" else "new tab"
+        print(f"  {kind:>8}  {target:<22}  {o['cwd']}  ->  --resume {o['session_id'][:8]}")
+
+    if args.dry_run:
+        return 0
+
+    if not args.yes:
+        try:
+            reply = input("\nProceed? [y/N] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return 0
+        if reply not in ("y", "yes"):
+            print("Aborted.")
+            return 0
+
+    failures = 0
+    for kind, tid, o in plan:
+        cmd = f"claude --resume {o['session_id']}"
+        try:
+            if kind == "inject":
+                ghostty_inject(tid, cmd)
+            else:
+                ghostty_new_tab(o["cwd"], cmd)
+        except RuntimeError as e:
+            print(f"  failed for {o['session_id'][:8]}: {e}", file=sys.stderr)
+            failures += 1
+    if failures:
+        return 1
+    print(f"Launched {len(plan)} session(s).")
+    return 0
+
+
 # ---------- main ----------
 
 
@@ -483,6 +663,23 @@ def main() -> int:
     p_back.add_argument("--dry-run", action="store_true",
                         help="report what would be added without writing")
     p_back.set_defaults(func=cmd_backfill)
+
+    p_launch = sub.add_parser(
+        "launch",
+        help="resume orphan sessions in Ghostty (inject into idle tabs, else new tab)",
+    )
+    p_launch.add_argument("--max-age-hours", type=float, default=DEFAULT_MAX_AGE_HOURS)
+    p_launch.add_argument("--all", action="store_true",
+                          help="ignore CLAUDE_CONFIG_DIR scoping")
+    p_launch.add_argument("--here", action="store_true",
+                          help="only orphans whose cwd matches $PWD")
+    p_launch.add_argument("--new-tabs-only", action="store_true",
+                          help="never inject into existing tabs; always open new ones")
+    p_launch.add_argument("--dry-run", action="store_true",
+                          help="show the plan without doing anything")
+    p_launch.add_argument("-y", "--yes", action="store_true",
+                          help="skip the confirmation prompt")
+    p_launch.set_defaults(func=cmd_launch)
 
     args = p.parse_args()
     return args.func(args)

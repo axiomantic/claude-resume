@@ -57,8 +57,35 @@ recoverable on the next reboot, seed the log from existing transcripts:
     claude-resume list                  # all orphans across all repos
     claude-resume here                  # interactive picker for $PWD
     claude-resume here --quiet          # one-line nudge (used in shell rc)
+    claude-resume launch                # resume all orphans in Ghostty (macOS)
     claude-resume backfill [--days N]   # seed log from existing transcripts
     claude-resume prune --keep-days 30  # compact the event log
+
+### `launch` (Ghostty, macOS)
+
+After a reboot, `claude-resume launch` resumes every orphan session at once.
+Default behavior:
+
+1. Reads the active Ghostty window's terminals via AppleScript.
+2. For each orphan, looks for an idle Ghostty tab whose working directory
+   matches the orphan's `cwd`. "Idle" is detected heuristically — a tab
+   whose title looks like a path or a bare shell name.
+3. Idle match found: types `claude --resume <id>` into that tab and
+   presses Enter.
+4. No match: opens a new tab in the front window with the cwd preset and
+   the resume command pre-typed.
+
+Flags:
+
+    --dry-run            Print the plan without doing anything.
+    --yes / -y           Skip the confirmation prompt.
+    --here               Only orphans whose cwd matches $PWD.
+    --all                Ignore CLAUDE_CONFIG_DIR scoping.
+    --new-tabs-only      Never inject into existing tabs; always open new.
+
+The injection heuristic is intentionally conservative — if it can't tell
+that a tab is idle, it opens a new tab instead. Pass `--new-tabs-only`
+if you don't trust the heuristic in your setup.
 
 ## Files
 
